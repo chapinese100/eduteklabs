@@ -1,0 +1,164 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # GUACD - Remote Desktop Proxy Engine
+  # ---------------------------------------------------------------------------
+  # The backend engine that physically handles RDP, VNC, and SSH connections.
+  # Students never interact with this container directly.
+  #
+  # PERSISTENT STORAGE - guac_data volume mounted at /data
+  #
+  #   /data/recordings  - Session recordings. guacd writes a binary file for
+  #                        every session that Guacamole can replay like a video.
+  #                        Without this volume recordings are lost on restart.
+  #
+  #   /data/drive       - Shared file drive. guacd handles the actual file
+  #                        transfer protocol to/from the VM, so it reads and
+  #                        writes the shared drive folder directly.
+  #                        Without this volume uploaded files are lost on restart.
+  # ---------------------------------------------------------------------------
+  guacd:
+    image: guacamole/guacd:latest
+    restart: unless-stopped
+    volumes:
+      - guac_data:/data
+    networks:
+      - guacnet
+
+
+  # ---------------------------------------------------------------------------
+  # MYSQL - Database
+  # ---------------------------------------------------------------------------
+  # Stores everything Guacamole knows: user accounts, hashed passwords,
+  # connection definitions (which VM, which protocol, which credentials),
+  # and user-to-connection permissions.
+  #
+  # PERSISTENT STORAGE - mysql_data volume mounted at /var/lib/mysql
+  #   This is the most critical volume in the stack.
+  #   Losing it means losing ALL users and ALL connection settings.
+  # ---------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    command:
+      - --default-authentication-plugin=mysql_native_password
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - guacnet
+
+
+  # ---------------------------------------------------------------------------
+  # GUACAMOLE - Web Application
+  # ---------------------------------------------------------------------------
+  # The web interface students open in their browser.
+  # Authenticates users against MySQL and sends connection requests to guacd.
+  # This container is stateless - all data lives in MySQL or in guacd's volume.
+  #
+  # NO PERSISTENT VOLUME NEEDED on this container.
+  #
+  # Key environment variables:
+  #
+  #   GUACD_HOSTNAME      - Tells Guacamole where guacd lives on the Docker
+  #                          network. FIXED: was missing in the original guide.
+  #                          Without it Guacamole defaults to localhost, which
+  #                          is wrong inside Docker — all sessions fail.
+  #
+  #   RECORDING_ENABLED   - Installs the session recording playback extension
+  #                          so admins can replay sessions from the Guacamole UI.
+  #                          Confirmed correct variable name per Apache docs.
+  #
+  #   RECORDING_SEARCH_PATH - The folder where Guacamole looks for recording
+  #                            files to play back. Must match the path used in
+  #                            the guacd volume above (/data/recordings).
+  #                            Confirmed correct variable name per Apache docs.
+  #
+  # The guac_data volume is also mounted here so Guacamole can read recordings
+  # for in-browser playback without copying files between containers.
+  # ---------------------------------------------------------------------------
+  guacamole:
+    image: guacamole/guacamole:latest
+    restart: unless-stopped
+    depends_on:
+      - mysql
+      - guacd
+    environment:
+      GUACD_HOSTNAME: guacd
+      MYSQL_HOSTNAME: mysql
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      RECORDING_ENABLED: "true"
+      RECORDING_SEARCH_PATH: /data/recordings
+    volumes:
+      - guac_data:/data
+    networks:
+      - guacnet
+
+
+  # ---------------------------------------------------------------------------
+  # CLOUDFLARED - Cloudflare Tunnel
+  # ---------------------------------------------------------------------------
+  # Creates an outbound-only encrypted tunnel from your server to Cloudflare.
+  # Students reach Guacamole through Cloudflare's edge — your server never
+  # needs a public IP or open firewall ports.
+  #
+  # NO PERSISTENT STORAGE NEEDED.
+  #   The tunnel token is loaded from the .env file at startup.
+  #   Nothing is written to disk. Cloudflare holds all tunnel state.
+  #
+  # FIXED: command was "tunnel run" in the original guide.
+  #   --no-autoupdate prevents cloudflared from trying to update itself inside
+  #   the container. The filesystem is read-only so the update crashes the
+  #   process. This flag disables that behavior completely.
+  # ---------------------------------------------------------------------------
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN}
+    networks:
+      - guacnet
+
+
+# ---------------------------------------------------------------------------
+# NAMED VOLUMES
+# ---------------------------------------------------------------------------
+# Docker manages these on the host at /var/lib/docker/volumes/
+#
+# These volumes SURVIVE:
+#   - Container restarts
+#   - Image updates (docker compose pull && docker compose up -d)
+#   - docker compose down   (WITHOUT the -v flag)
+#
+# These volumes are PERMANENTLY DELETED by:
+#   - docker compose down -v   <-- never run this unless you want to wipe everything
+#
+# guac_data  - Recordings and shared drive files (written by guacd, read by guacamole)
+# mysql_data - All Guacamole users, passwords, and connection settings
+# ---------------------------------------------------------------------------
+volumes:
+  guac_data:
+  mysql_data:
+
+
+# ---------------------------------------------------------------------------
+# NETWORK
+# ---------------------------------------------------------------------------
+# All containers share this bridge network so they reach each other by name.
+#   guacamole  -->  guacd        (hostname "guacd",      port 4822)
+#   guacamole  -->  mysql        (hostname "mysql",      port 3306)
+#   cloudflared --> guacamole    (hostname "guacamole",  port 8080)
+#
+# No container is directly exposed to the internet.
+# Only cloudflared makes an outbound connection to Cloudflare's edge network.
+# ---------------------------------------------------------------------------
+networks:
+  guacnet:
+    driver: bridge
